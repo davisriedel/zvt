@@ -4,8 +4,6 @@ use crate::{encoding, ZvtEnum, ZvtParser, ZvtSerializer};
 use anyhow::Result;
 use async_stream::try_stream;
 use futures::Stream;
-use std::boxed::Box;
-use std::marker::Unpin;
 use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -339,16 +337,8 @@ impl Sequence for EndOfDay {
     }
 }
 
-/// Reservation sequence as defined under 2.8.
-///
-/// The ECR requests PT to reserve a certain payment-amount. This is necessary
-/// when the final payment-amount is only established after the authorization.
-/// In this case the ECR firstly reserves an amount (= maximal Possible
-/// payment-amount) and then, after the sales-process, releases the unused
-/// amount via a [PartialReversal] or Book Total (06 24, not implemented).
-pub struct Reservation;
-
-/// Response to [packets::Reservation] message, as defined under 2.8.
+/// Response to [packets::Authorization] (defined under 2.2) and
+/// [packets::Reservation] (defined under 2.8) message
 ///
 /// The response is the same as for Authorization, defined in chapter 2.1.
 #[derive(Debug, ZvtEnum)]
@@ -369,6 +359,54 @@ pub enum AuthorizationResponse {
     /// 2.2.9
     Abort(packets::Abort),
 }
+
+/// Authorization sequence as defined under 2.2.
+///
+/// This command initiates a payment process and transmits the amount from the
+/// ECR to PT. The result of the payment process is reported to the ECR after
+/// completion of the booking process.
+pub struct Authorization;
+
+impl Sequence for Authorization {
+    type Input = packets::Authorization;
+    type Output = AuthorizationResponse;
+
+    fn into_stream<'a, Source>(
+        input: &'a Self::Input,
+        src: &'a mut PacketTransport<Source>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Self::Output>> + Send + 'a>>
+    where
+        Source: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+        Self: 'a,
+    {
+        let s = try_stream! {
+            // 2.2
+            src.write_packet_with_ack(input).await?;
+
+            loop {
+                let packet = src.read_packet().await?;
+                src.write_packet(&packets::Ack {}).await?;
+                match packet {
+                    AuthorizationResponse::CompletionData(_) | AuthorizationResponse::Abort(_) => {
+                        yield packet;
+                        break;
+                    }
+                    _ => yield packet,
+                }
+            }
+        };
+        Box::pin(s)
+    }
+}
+
+/// Reservation sequence as defined under 2.8.
+///
+/// The ECR requests PT to reserve a certain payment-amount. This is necessary
+/// when the final payment-amount is only established after the authorization.
+/// In this case the ECR firstly reserves an amount (= maximal Possible
+/// payment-amount) and then, after the sales-process, releases the unused
+/// amount via a [PartialReversal] or Book Total (06 24, not implemented).
+pub struct Reservation;
 
 impl Sequence for Reservation {
     type Input = packets::Reservation;

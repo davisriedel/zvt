@@ -105,6 +105,12 @@ pub struct Bmp60 {
 }
 
 #[derive(Debug, PartialEq, Zvt)]
+pub struct AuthData {
+    #[zvt_tlv(tag = 0xe9)]
+    pub bmp_data: Option<Bmp60>,
+}
+
+#[derive(Debug, PartialEq, Zvt)]
 pub struct PreAuthData {
     #[zvt_tlv(tag = 0xe9)]
     pub bmp_data: Option<Bmp60>,

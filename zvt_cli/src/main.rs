@@ -22,6 +22,7 @@ enum SubCommands {
     PrintSystemConfiguration(PrintSystemConfigurationArgs),
     EndOfDay(EndOfDayArgs),
     ReadCard(ReadCardArgs),
+    Authorization(AuthorizationArgs),
     Reservation(ReservationArgs),
     PartialReversal(PartialReversalArgs),
     ChangeHostConfiguration(ChangeHostConfigurationArgs),
@@ -121,6 +122,39 @@ struct ReadCardArgs {
     /// documentation.
     #[argh(option, default = "7")]
     allowed_cards: u8,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
+/// Deduct money from a card.
+#[argh(subcommand, name = "authorization")]
+struct AuthorizationArgs {
+    /// currency code. The default is EUR.
+    #[argh(option, default = "978")]
+    currency_code: usize,
+
+    /// amount in the fractional monetary unit (see
+    /// https://www.thefreedictionary.com/fractional+monetary+unit) which should be authorized.
+    #[argh(option, default = "5")]
+    amount: usize,
+
+    /// the payment type, defined in table 4. The default is "Payment according to PTs decision
+    /// excluding `GeldKarte`.
+    // TODO(hrapp): When bit 2 is set here, the PT should execute the payment using the data from
+    // the previous ReadCard command. Which might mean we do not need to reread.
+    #[argh(option, default = "64")]
+    payment_type: u8,
+
+    /// track 2 data to identify past read card.
+    #[argh(option)]
+    track_2_data: Option<String>,
+
+    /// bmp_prefix. If this is set, bmp_data must be set too.
+    #[argh(option)]
+    bmp_prefix: Option<String>,
+
+    /// bmp_data. If this is set, bmp_prefix must be set too.
+    #[argh(option)]
+    bmp_data: Option<String>,
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -439,27 +473,52 @@ async fn read_card(socket: &mut PacketTransport, args: &ReadCardArgs) -> Result<
 fn prep_bmp_data(
     bmp_prefix: Option<String>,
     bmp_data: Option<String>,
-) -> Result<Option<packets::tlv::PreAuthData>> {
+) -> Result<Option<packets::tlv::Bmp60>> {
     match (bmp_prefix, bmp_data) {
-        (Some(bmp_prefix), Some(bmp_data)) => Ok(Some(packets::tlv::PreAuthData {
-            bmp_data: Some(packets::tlv::Bmp60 {
+        (Some(bmp_prefix), Some(bmp_data)) => Ok(
+            Some(packets::tlv::Bmp60 {
                 bmp_prefix,
                 bmp_data,
             }),
-        })),
+        ),
         (None, None) => Ok(None),
         _ => bail!("Either none or both of bmp_data and bmp_prefix must be given."),
     }
 }
 
+async fn authorization(socket: &mut PacketTransport, args: AuthorizationArgs) -> Result<()> {
+    let bmp_data = prep_bmp_data(args.bmp_prefix, args.bmp_data)?;
+    let request = packets::Authorization {
+        currency: Some(args.currency_code),
+        amount: Some(args.amount),
+        payment_type: Some(args.payment_type),
+        track_2_data: args.track_2_data,
+        tlv: Some(packets::tlv::AuthData { bmp_data }),
+        ..packets::Authorization::default()
+    };
+
+    let mut stream = sequences::Authorization::into_stream(&request, socket);
+    use sequences::AuthorizationResponse::*;
+    while let Some(response) = stream.next().await {
+        match response? {
+            IntermediateStatusInformation(_) | CompletionData(_) => (),
+            PrintLine(data) => log::info!("{}", data.text),
+            PrintTextBlock(data) => log::info!("{data:#?}"),
+            Abort(data) => bail!("Received Abort: {:?}", data),
+            StatusInformation(data) => log::info!("StatusInformation: {:#?}", data),
+        }
+    }
+    Ok(())
+}
+
 async fn reservation(socket: &mut PacketTransport, args: ReservationArgs) -> Result<()> {
-    let tlv = prep_bmp_data(args.bmp_prefix, args.bmp_data)?;
+    let bmp_data = prep_bmp_data(args.bmp_prefix, args.bmp_data)?;
     let request = packets::Reservation {
         currency: Some(args.currency_code),
         amount: Some(args.amount),
         payment_type: Some(args.payment_type),
         track_2_data: args.track_2_data,
-        tlv,
+        tlv: Some(packets::tlv::PreAuthData { bmp_data }),
         ..packets::Reservation::default()
     };
 
@@ -478,14 +537,13 @@ async fn reservation(socket: &mut PacketTransport, args: ReservationArgs) -> Res
 }
 
 async fn partial_reversal(socket: &mut PacketTransport, args: PartialReversalArgs) -> Result<()> {
-    let tlv = prep_bmp_data(args.bmp_prefix, args.bmp_data)?;
-
+    let bmp_data = prep_bmp_data(args.bmp_prefix, args.bmp_data)?;
     let request = packets::PartialReversal {
         receipt_no: Some(args.receipt),
         amount: Some(args.amount),
         payment_type: Some(args.payment_type),
         currency: Some(args.currency_code),
-        tlv,
+        tlv: Some(packets::tlv::PreAuthData { bmp_data }),
     };
 
     let mut stream = sequences::PartialReversal::into_stream(&request, socket);
@@ -551,6 +609,7 @@ async fn main() -> Result<()> {
         SubCommands::PrintSystemConfiguration(_) => print_system_diagnosis(&mut socket).await?,
         SubCommands::EndOfDay(_) => end_of_day(&mut socket, args.password).await?,
         SubCommands::ReadCard(a) => read_card(&mut socket, &a).await?,
+        SubCommands::Authorization(a) => authorization(&mut socket, a).await?,
         SubCommands::Reservation(a) => reservation(&mut socket, a).await?,
         SubCommands::PartialReversal(a) => partial_reversal(&mut socket, a).await?,
         SubCommands::ChangeHostConfiguration(a) => {
